@@ -11,9 +11,35 @@ from llama_index.llms.groq import Groq
 import supabase
 from supabase import create_client
 from io import BytesIO
+import hashlib
+import pickle
+from datetime import datetime
 
 # Import the update module
 import update_db
+
+
+
+
+
+def get_conversation_history(max_messages=10, include_system=True):
+    """Get recent conversation history for context, excluding current query"""
+    messages = st.session_state.messages
+
+    if len(messages) <= 1:  # No previous conversation
+        return ""
+
+    # Get the last max_messages pairs, excluding the current user message
+    recent_messages = messages[-max_messages-1:-1] if len(messages) > 1 else messages[:-1]
+
+    history_parts = []
+    for msg in recent_messages:
+        role = msg["role"]
+        content = msg["content"][:500]  # Truncate long messages
+        history_parts.append(f"{role.title()}: {content}")
+
+    return "\n".join(history_parts)
+
 
 # Load in the API keys
 try:
@@ -57,8 +83,6 @@ try:
     if missing_columns:
         st.warning(f"⚠️ Missing expected columns: {missing_columns}")
     
-    st.success(f"✅ Loaded {len(DB_IN_DF)} records from Supabase")
-    
 except Exception as e:
     error_message = str(e).lower()
     
@@ -98,7 +122,7 @@ if "top_k" not in st.session_state:
 
 # Initialize mathematical mode in session state
 if "math_mode" not in st.session_state:
-    st.session_state.math_mode = False
+    st.session_state.math_mode = True
 
 # Initialize upload dialog state
 if "show_upload_dialog" not in st.session_state:
@@ -107,6 +131,7 @@ if "show_upload_dialog" not in st.session_state:
 # Initialize password verification state
 if "password_verified" not in st.session_state:
     st.session_state.password_verified = False
+
 
 # Initialize session state for query engine (load once)
 if "query_engine" not in st.session_state:
@@ -144,7 +169,7 @@ if "query_engine" not in st.session_state:
             # Store index for stats
             st.session_state.index = index
             
-            st.success("✅ Knowledge base loaded successfully!")
+            #st.success("✅ Knowledge base loaded successfully!")
             
         except Exception as e:
             st.error(f"❌ Error loading knowledge base: {str(e)}")
@@ -167,7 +192,19 @@ def execute_sql_query(sql_query):
 
 def generate_sql_from_query(user_query):
     """Use LLM to convert natural language to SQL"""
-    prompt = f"""You are an expert SQL query generator for a cotton variety trials database.
+    # Get conversation context for better SQL generation
+    conversation_history = get_conversation_history(max_messages=8)
+
+    context_section = ""
+    if conversation_history:
+        context_section = f"""
+Previous Conversation Context:
+{conversation_history}
+
+Use this context to understand follow-up questions and maintain consistency in your SQL generation.
+"""
+
+    prompt = f"""You are an expert SQL query generator for a cotton variety trials database.{context_section}
 
 Database Schema:
 - Table: VARIETY_YIELD
@@ -191,7 +228,7 @@ IMPORTANT RULES:
 4. For aggregations (max, min, avg), include relevant grouping
 5. Always include Year in results when specified in the query
 
-User Query: {user_query}
+Current User Query: {user_query}
 
 Generate the SQL query:"""
     try:
@@ -337,6 +374,11 @@ def create_visualization(df, viz_params):
         title = viz_params.get('title', 'Data Visualization')
         x_label = viz_params.get('x_label', x_col)
         y_label = viz_params.get('y_label', y_col)
+
+        if 'Year' in df.columns:
+            df['Year'] = df['Year'].astype(int)
+            if x_col == 'Year':
+                df['Year'] = df['Year'].astype(str)
         
         # Create appropriate chart based on type
         if chart_type == 'line':
@@ -373,7 +415,8 @@ def create_visualization(df, viz_params):
             template='plotly_white',
             hovermode='x unified'
         )
-        
+        if x_col == 'Year':
+            fig.update_xaxes(type='category')
         return fig
     except Exception as e:
         print(f"Error creating visualization: {e}")
@@ -381,30 +424,43 @@ def create_visualization(df, viz_params):
 
 def generate_natural_language_response(user_query, sql_query, results, column_names):
     """Use LLM to convert SQL results back to natural language"""
-    # Format results as a readable string
+    # Get conversation context for more coherent responses
+    conversation_history = get_conversation_history(max_messages=6)
+
+    context_section = ""
+    if conversation_history:
+        context_section = f"""
+Previous Conversation Context:
+{conversation_history}
+
+Use this context to provide coherent, contextual responses that reference previous questions and maintain conversation flow.
+"""
+
+    # Format results as a readable string (use all results for accurate LLM answers)
     if not results:
         results_text = "No results found."
     else:
         results_text = "Query Results:\n"
         results_text += " | ".join(column_names) + "\n"
         results_text += "-" * 50 + "\n"
-        for row in results:  # Limit to first 10 rows for context
+        for row in results:  # Use all rows for LLM context to ensure accurate answers
             results_text += " | ".join(str(val) for val in row) + "\n"
-    
-    prompt = f"""You are a helpful agricultural data analyst. A user asked a question and we queried a database.
 
-User Question: {user_query}
+    prompt = f"""You are a helpful agricultural data analyst having an ongoing conversation.{context_section}
+
+Current User Question: {user_query}
 
 SQL Query Executed:
 {sql_query}
 
 {results_text}
 
-Provide a clear, concise answer to the user's question based on the query results. 
+Provide a clear, concise answer to the user's question based on the query results.
 - If there are specific numbers, include them
-- Be conversational and natural
+- Be conversational and natural, referencing previous context when relevant
 - If no results were found, explain that clearly
-- If there are multiple results, summarize the key findings"""
+- If there are multiple results, summarize the key findings
+- Maintain continuity with the ongoing conversation"""
 
     try:
         response = st.session_state.llm.complete(prompt)
@@ -430,16 +486,16 @@ for message in st.session_state.messages:
         
         # Show visualization if available
         if message["role"] == "assistant" and "visualization" in message and message["visualization"] is not None:
-            st.plotly_chart(message["visualization"], use_container_width=True)
+            # Use timestamp as unique key to avoid duplicate ID errors
+            chart_key = f"chart_{message.get('timestamp', 0)}"
+            st.plotly_chart(message["visualization"], use_container_width=True, key=chart_key)
             if "viz_reasoning" in message:
                 st.caption(f"📊 {message['viz_reasoning']}")
         
-        # Show SQL query and results if in math mode
+        # Show SQL results if in math mode
         if message["role"] == "assistant" and "sql_query" in message:
-            with st.expander("🔢 SQL Query & Results"):
-                st.code(message["sql_query"], language="sql")
+            with st.expander("🔢 Tabular Results"):
                 if "sql_results" in message and message["sql_results"] is not None:
-                    st.markdown("**Query Results:**")
                     st.dataframe(message["sql_results"])
         
         # Show sources if available (RAG mode)
@@ -470,7 +526,7 @@ for message in st.session_state.messages:
                     st.divider()
 
 # Chat input
-if prompt := st.chat_input("Ask me anything about your documents..."):
+if prompt := st.chat_input("Ask me anything about cotton variety trials..."):
     # Add user message to chat history
     st.session_state.messages.append({"role": "user", "content": prompt})
     
@@ -486,15 +542,11 @@ if prompt := st.chat_input("Ask me anything about your documents..."):
                     # Mathematical Mode: SQL-based query with visualization
                     with st.spinner("Generating SQL query..."):
                         sql_query = generate_sql_from_query(prompt)
-                        
-                        if st.session_state.get("debug_mode", False):
-                            st.info(f"Generated SQL:\n```sql\n{sql_query}\n```")
-                    
+                        print(f"Generated SQL Query: {sql_query}")  # Print to console
+
                     with st.spinner("Executing query..."):
                         results, column_names = execute_sql_query(sql_query)
-                        
-                        if st.session_state.get("debug_mode", False):
-                            st.info(f"Found {len(results)} results")
+                        print(f"Query returned {len(results)} results")  # Print to console
                     
                     # Visualization pipeline
                     visualization = None
@@ -504,8 +556,7 @@ if prompt := st.chat_input("Ask me anything about your documents..."):
                         # Stage 1: Heuristic check
                         should_check_llm, heuristic_reason = should_visualize_heuristic(results, column_names, sql_query)
                         
-                        if st.session_state.get("debug_mode", False):
-                            st.info(f"🔍 Heuristic Check: {heuristic_reason}")
+                        print(f"Heuristic Check: {heuristic_reason}")  # Print to console
                         
                         if should_check_llm:
                             # Stage 2: LLM decision
@@ -522,12 +573,11 @@ if prompt := st.chat_input("Ask me anything about your documents..."):
                                     viz_reasoning = viz_decision.get('reasoning', '')
                                     
                                     if visualization:
-                                        st.plotly_chart(visualization, use_container_width=True)
+                                        st.plotly_chart(visualization, use_container_width=True, key="current_response_chart")
                                         st.caption(f"📊 {viz_reasoning}")
                                 elif viz_decision:
                                     viz_reasoning = viz_decision.get('reasoning', 'Visualization not needed')
-                                    if st.session_state.get("debug_mode", False):
-                                        st.info(f"ℹ️ No visualization: {viz_reasoning}")
+                                    print(f"Visualization decision: {viz_reasoning}")  # Print to console
                     
                     with st.spinner("Generating answer..."):
                         response_text = generate_natural_language_response(
@@ -537,9 +587,8 @@ if prompt := st.chat_input("Ask me anything about your documents..."):
                     # Display response
                     st.markdown(response_text)
                     
-                    # Show SQL and results in expander
-                    with st.expander("🔢 SQL Query & Results"):
-                        st.code(sql_query, language="sql")
+                    # Show results in expander
+                    with st.expander("🔢 Tabular Results"):
                         if results:
                             df = pd.DataFrame(results, columns=column_names)
                             st.dataframe(df)
@@ -559,8 +608,22 @@ if prompt := st.chat_input("Ask me anything about your documents..."):
                     })
                     
                 else:
-                    # RAG Mode: Document-based query
-                    response = st.session_state.query_engine.query(prompt)
+                    # RAG Mode: Document-based query with conversation context
+                    # Get conversation history for context-aware queries
+                    conversation_history = get_conversation_history(max_messages=10)
+
+                    # Enhance the query with conversation context
+                    if conversation_history:
+                        enhanced_prompt = f"""Previous conversation context:
+{conversation_history}
+
+Current question: {prompt}
+
+Please provide a comprehensive answer based on the documents, taking into account the conversation history above."""
+                    else:
+                        enhanced_prompt = prompt
+
+                    response = st.session_state.query_engine.query(enhanced_prompt)
                     
                     # Debug: Print to console
                     print("\n" + "="*50)
@@ -664,7 +727,34 @@ if prompt := st.chat_input("Ask me anything about your documents..."):
 # Sidebar with controls
 with st.sidebar:
     st.header("⚙️ Settings")
-    
+
+    # Data Guide - Always visible at top of sidebar
+    st.subheader("📖 What You Can Ask About")
+    st.markdown("""
+    Use these terms to ask specific questions about the cotton trials:
+
+    **🌾 Basic Info**
+    * **Variety**: The name of the cotton type.
+    * **Trial Location**: Where the cotton was grown.
+    * **Year**: The year of the harvest.
+
+    **💰 Production & Money**
+    * **Lint**: The amount of cotton produced (Yield in lbs/acre).
+    * **Lint Value**: Total revenue earned per acre ($/acre).
+    * **Turnout**: The percentage of usable cotton.
+
+    **🧵 Quality Metrics**
+    * **Micronaire**: How thick/fine the fiber is.
+    * **Length**: How long the fibers are (inches).
+    * **Strength**: How strong the fibers are (g/tex).
+    """)
+    st.info("💡 **Example Questions:**\n"
+           "* 'Which Variety had the highest Lint yield in 2023?'\n"
+           "* 'How did PHY 400 W3FE yield change over years?'\n"
+           "* 'What was max yield in Burleson 2024?'")
+
+    st.divider()
+
     # Data Upload Section (Password Protected)
     st.subheader("📤 Data Management")
     
@@ -831,57 +921,39 @@ with st.sidebar:
         st.session_state.debug_mode = False
     st.session_state.debug_mode = debug_mode
     
-    # Show index info
-    st.divider()
-    st.subheader("📊 System Info")
-    
-    if st.session_state.math_mode:
-        # Show database info
-        try:
-            conn = sqlite3.connect(':memory:')
-            DB_IN_DF.to_sql('VARIETY_YIELD', conn, if_exists='replace', index=False)
-            cursor = conn.cursor()
-            cursor.execute("SELECT COUNT(*) FROM VARIETY_YIELD")
-            count = cursor.fetchone()[0]
-            conn.close()
-            st.metric("Database Records", count)
-            st.info("**Table:** VARIETY_YIELD\n**Fields:** Variety, Lint, Turnout, Micronaire, Length, Strength, Uniformity, LoanValue, LintValue, TrialLocation, Year")
-        except Exception as e:
-            st.warning(f"Database not found: {e}")
-    else:
-        # Show RAG info
-        if "index" in st.session_state:
+    # Show index info (only in debug mode)
+    if st.session_state.debug_mode:
+        st.divider()
+        st.subheader("📊 System Info")
+
+        if st.session_state.math_mode:
+            # Show database info
             try:
-                docstore = st.session_state.index.docstore
-                num_docs = len(docstore.docs)
-                st.metric("Total Documents/Chunks", num_docs)
-                
-                st.info("**Embedding Model:**\nBAAI/bge-small-en-v1.5")
-                st.info("**LLM Model:**\nLlama 3.3 70B (Groq)")
-                
+                conn = sqlite3.connect(':memory:')
+                DB_IN_DF.to_sql('VARIETY_YIELD', conn, if_exists='replace', index=False)
+                cursor = conn.cursor()
+                cursor.execute("SELECT COUNT(*) FROM VARIETY_YIELD")
+                count = cursor.fetchone()[0]
+                conn.close()
+                st.metric("Database Records", count)
+                st.info("**Table:** VARIETY_YIELD\n**Fields:** Variety, Lint, Turnout, Micronaire, Length, Strength, Uniformity, LoanValue, LintValue, TrialLocation, Year")
             except Exception as e:
-                st.warning(f"Could not retrieve index stats: {e}")
-    
-    st.divider()
-    st.markdown("""
-    ### 💡 Tips
-    
-    **RAG Mode (Documents):**
-    - Ask questions about your documents
-    - Check sources to verify information
-    
-    **Mathematical Mode (SQL + Viz):**
-    - Ask statistical questions about trial data
-    - Auto-generates charts for trends & comparisons
-    - Example: "How did PHY 400 W3FE yield change over years?"
-    - Example: "What was max yield in Burleson 2024?"
-    
-    **General:**
-    - Use debug mode to see pipeline details
-    - Clear chat history to start fresh
-    """)
-    
-    # API Key status
-    st.divider()
-    api_key_status = "✅ Set" if os.environ.get("GROQ_API_KEY") else "❌ Not Set"
-    st.caption(f"GROQ_API_KEY: {api_key_status}")
+                st.warning(f"Database not found: {e}")
+        else:
+            # Show RAG info
+            if "index" in st.session_state:
+                try:
+                    docstore = st.session_state.index.docstore
+                    num_docs = len(docstore.docs)
+                    st.metric("Total Documents/Chunks", num_docs)
+
+                    st.info("**Embedding Model:**\nBAAI/bge-small-en-v1.5")
+                    st.info("**LLM Model:**\nLlama 3.3 70B (Groq)")
+
+                except Exception as e:
+                    st.warning(f"Could not retrieve index stats: {e}")
+
+        # API Key status
+        st.divider()
+        api_key_status = "✅ Set" if os.environ.get("GROQ_API_KEY") else "❌ Not Set"
+        st.caption(f"GROQ_API_KEY: {api_key_status}")
